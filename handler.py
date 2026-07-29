@@ -56,7 +56,11 @@ CONFIG = Path(os.environ.get("WORKFLOW_CONFIG", "/workflow_config.json"))
 
 FPS = 16                      # нативная частота Wan 2.2 A14B, менять нельзя
 FRAMES_PER_SEGMENT = 81       # 81/16 = 5.06 сек. Должно быть вида 4n+1
-WIDTH, HEIGHT = 832, 480      # генерим дёшево, апскейлим в конце
+PIXEL_BUDGET = 832 * 480      # ~400k пикселей. Держим постоянным: пропорции берём
+                              # из фото, но площадь не меняем, иначе время и цена
+                              # генерации поехали бы вслед за форматом снимка
+DIM_STEP = 16                 # Wan требует размеры, кратные 16
+MIN_DIM, MAX_DIM = 320, 1280
 STEPS = 4                     # с Lightning LoRA. Без неё было бы 20 и в 5 раз дольше
 CFG = 1.0                     # ровно 1.0, иначе картинка пережжённая
 TAIL_OFFSET = 3               # опорный кадр берём за 3 до конца: последний самый мыльный
@@ -69,6 +73,39 @@ S3_ENDPOINT = os.environ.get("S3_ENDPOINT")
 
 
 # ------------------------------------------------------------- ожидание ComfyUI
+
+def fit_dimensions(image_path: Path) -> tuple[int, int]:
+    """
+    Подбирает размер кадра под пропорции исходного фото.
+
+    Раньше здесь было жёстко 832x480, из-за чего вертикальные снимки и кадры
+    16:9 обрезались. Теперь берём соотношение сторон из самого фото, а площадь
+    оставляем прежней - так ничего не режется, но время генерации не скачет
+    от формата к формату.
+
+    Примеры того, что получается:
+        4:3   ->  736 x 544
+        16:9  ->  864 x 480
+        9:16  ->  480 x 864
+        1:1   ->  640 x 640
+    """
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return 832, 480
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return 832, 480
+
+    aspect = w / h
+    new_h = (PIXEL_BUDGET / aspect) ** 0.5
+    new_w = new_h * aspect
+
+    def snap(v: float) -> int:
+        v = int(round(v / DIM_STEP) * DIM_STEP)
+        return max(MIN_DIM, min(MAX_DIM, v))
+
+    return snap(new_w), snap(new_h)
+
 
 def wait_for_comfy(timeout: int = 300) -> None:
     """Воркер стартует раньше, чем ComfyUI успевает подняться."""
@@ -111,7 +148,7 @@ def upload_image(path: Path) -> str:
 
 
 def run_segment(template: dict, cfg: dict, prompt: str, start: Path,
-                seed: int, workdir: Path) -> Path:
+                seed: int, workdir: Path, size: tuple[int, int]) -> Path:
     wf = json.loads(json.dumps(template))  # глубокая копия: шаблон не мутируем
 
     node_by_role(wf, cfg, "prompt")["inputs"]["text"] = prompt
@@ -119,8 +156,7 @@ def run_segment(template: dict, cfg: dict, prompt: str, start: Path,
 
     video = node_by_role(wf, cfg, "video_cfg")
     video["inputs"]["length"] = FRAMES_PER_SEGMENT
-    video["inputs"]["width"] = WIDTH
-    video["inputs"]["height"] = HEIGHT
+    video["inputs"]["width"], video["inputs"]["height"] = size
 
     # Шаги и cfg проставляем принудительно. Схема ComfyUI по умолчанию идёт
     # в режиме 10+10 шагов без ускорения - это пятикратная переплата по времени.
@@ -235,10 +271,14 @@ def concat_and_upscale(segments: list[Path], workdir: Path, upscale: bool) -> Pa
     if not upscale:
         return joined
 
-    out = workdir / "final_720p.mp4"
+    # Увеличиваем в 1.5 раза по обеим сторонам, а не до фиксированной высоты 720.
+    # Иначе вертикальное видео 480x848 после "scale=-2:720" стало бы 408x720,
+    # то есть уменьшилось бы вместо апскейла.
+    out = workdir / "final_up.mp4"
     subprocess.run([
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(joined),
-        "-vf", "scale=-2:720:flags=lanczos,unsharp=5:5:0.6",
+        "-vf", "scale=iw*1.5:ih*1.5:flags=lanczos,"
+               "scale=trunc(iw/2)*2:trunc(ih/2)*2,unsharp=5:5:0.6",
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
         "-movflags", "+faststart", str(out),
     ], check=True)
@@ -295,12 +335,17 @@ def handler(job: dict) -> dict:
         anchor = workdir / "anchor_000.png"
         shutil.copy(original, anchor)
 
+        # Пропорции кадра берём из фото, чтобы 16:9 и вертикальные снимки
+        # не обрезались. Клиент может задать размер явно через width/height.
+        size = (int(inp["width"]), int(inp["height"])) \
+            if inp.get("width") and inp.get("height") else fit_dimensions(original)
+
         started = time.time()
         raw: list[Path] = []
 
         # весь чейнинг здесь: модель загружена один раз и живёт в VRAM
         for i in range(n):
-            raw.append(run_segment(template, cfg, prompt, anchor, seed + i, workdir))
+            raw.append(run_segment(template, cfg, prompt, anchor, seed + i, workdir, size))
             if i < n - 1:
                 anchor = grab_anchor(raw[-1], workdir / f"anchor_{i + 1:03d}.png")
                 if (i + 1) % REFRESH_EVERY == 0:
