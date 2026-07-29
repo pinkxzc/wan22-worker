@@ -287,6 +287,32 @@ def concat_and_upscale(segments: list[Path], workdir: Path, upscale: bool) -> Pa
 
 # ------------------------------------------------------------------- ввод/вывод
 
+def purge_comfy_dirs() -> None:
+    """
+    Чистит рабочие папки ComfyUI после генерации.
+
+    Наш собственный workdir убирается в finally, а вот ComfyUI складывает
+    результат каждого сегмента в /comfyui/output, а каждый загруженный опорный
+    кадр - в /comfyui/input, и сам их никогда не удаляет. Пока воркер тёплый и
+    обслуживает запрос за запросом, там копится около 20 МБ на каждый
+    30-секундный ролик.
+
+    При остановке воркера контейнер стирается целиком, так что это подстраховка
+    на случай долгой непрерывной нагрузки, когда воркер живёт часами.
+    """
+    for sub in ("output", "input", "temp"):
+        d = Path("/comfyui") / sub
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            if p.name.startswith("."):      # служебные файлы ComfyUI не трогаем
+                continue
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+            except Exception:
+                pass
+
+
 def fetch_input_image(src: str, dst: Path) -> Path:
     if src.startswith(("http://", "https://")):
         urllib.request.urlretrieve(src, dst)
@@ -372,6 +398,7 @@ def handler(job: dict) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        purge_comfy_dirs()
 
 
 runpod.serverless.start({"handler": handler})
