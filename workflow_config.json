@@ -1,0 +1,8 @@
+{
+  "prompt": "130:107",
+  "start_image": "97",
+  "video_cfg": "130:128",
+  "sampler_high": "130:110",
+  "sampler_low": "130:111",
+  "video_out": "108"
+}
