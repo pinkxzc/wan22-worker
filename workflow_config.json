@@ -4,5 +4,7 @@
   "video_cfg": "130:128",
   "sampler_high": "130:110",
   "sampler_low": "130:111",
-  "video_out": "108"
+  "video_out": "108",
+  "lora_high": "130:126",
+  "lora_low": "130:127"
 }
