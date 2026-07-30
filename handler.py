@@ -61,9 +61,30 @@ PIXEL_BUDGET = 832 * 480      # ~400k пикселей. Держим посто�
                               # генерации поехали бы вслед за форматом снимка
 DIM_STEP = 16                 # Wan требует размеры, кратные 16
 MIN_DIM, MAX_DIM = 320, 1280
-STEPS = 4                     # с Lightning LoRA. Без неё было бы 20 и в 5 раз дольше
-CFG = 1.0                     # ровно 1.0, иначе картинка пережжённая
-TAIL_OFFSET = 3               # опорный кадр берём за 3 до конца: последний самый мыльный
+
+# Режимы качества.
+#
+# Главное, что надо понимать про cfg: это и есть механизм следования промту.
+# При cfg=1.0 модель не сравнивает результат с промтом и делает что хочет -
+# отсюда жалобы "просил одно, получил другое". Lightning LoRA обучена без CFG,
+# поэтому четыре шага и послушный промт несовместимы.
+#
+# Компромисс: ослабляем LoRA и поднимаем cfg. Модель начинает слушаться, но
+# каждый шаг считается дважды (с промтом и без), плюс шагов больше - отсюда
+# рост времени.
+QUALITY = {
+    # имя         шаги  cfg   сила LoRA   примерно на сегмент
+    "fast":     dict(steps=4,  cfg=1.0, lora=1.0),   # ~60 сек, промт слабо
+    "balanced": dict(steps=6,  cfg=1.5, lora=0.8),   # ~2 мин,  промт средне
+    "high":     dict(steps=8,  cfg=2.5, lora=0.6),   # ~2.7 мин, промт хорошо
+    "max":      dict(steps=20, cfg=3.5, lora=0.0),   # ~6 мин,  промт отлично
+}
+DEFAULT_QUALITY = "high"
+
+# Сегменты перекрываются, чтобы стык не был виден. Каждый следующий сегмент
+# начинается с кадра, который в предыдущем был не последним, а за OVERLAP до
+# конца - и эти кадры мы потом сводим кроссфейдом.
+OVERLAP_FRAMES = 12           # 0.75 сек при 16 fps
 REFRESH_EVERY = 3             # каждые N сегментов подмешиваем исходное фото
 REFRESH_BLEND = 0.15
 MAX_SEGMENTS = 24             # предохранитель: 24 x 5.06 = ~2 минуты
@@ -148,7 +169,8 @@ def upload_image(path: Path) -> str:
 
 
 def run_segment(template: dict, cfg: dict, prompt: str, start: Path,
-                seed: int, workdir: Path, size: tuple[int, int]) -> Path:
+                seed: int, workdir: Path, size: tuple[int, int],
+                quality: dict) -> Path:
     wf = json.loads(json.dumps(template))  # глубокая копия: шаблон не мутируем
 
     node_by_role(wf, cfg, "prompt")["inputs"]["text"] = prompt
@@ -158,17 +180,25 @@ def run_segment(template: dict, cfg: dict, prompt: str, start: Path,
     video["inputs"]["length"] = FRAMES_PER_SEGMENT
     video["inputs"]["width"], video["inputs"]["height"] = size
 
-    # Шаги и cfg проставляем принудительно. Схема ComfyUI по умолчанию идёт
-    # в режиме 10+10 шагов без ускорения - это пятикратная переплата по времени.
+    steps = quality["steps"]
     high = node_by_role(wf, cfg, "sampler_high")
     low = node_by_role(wf, cfg, "sampler_low")
     for s in (high, low):
-        s["inputs"]["steps"] = STEPS
-        s["inputs"]["cfg"] = CFG          # ровно 1.0: Lightning обучена без CFG
+        s["inputs"]["steps"] = steps
+        s["inputs"]["cfg"] = quality["cfg"]
+    # Wan 2.2 - MoE: первую половину шагов ведёт высокошумный эксперт, вторую
+    # низкошумный. Границу держим ровно посередине.
     high["inputs"]["start_at_step"] = 0
-    high["inputs"]["end_at_step"] = STEPS // 2
-    low["inputs"]["start_at_step"] = STEPS // 2
+    high["inputs"]["end_at_step"] = steps // 2
+    low["inputs"]["start_at_step"] = steps // 2
     low["inputs"]["end_at_step"] = 10000
+
+    # Сила Lightning LoRA. При cfg > 1 её надо ослабить, иначе дистилляция
+    # перебивает guidance и промт всё равно игнорируется. Ноль - обход ноды.
+    for role in ("lora_high", "lora_low"):
+        node = node_by_role(wf, cfg, role, required=False)
+        if node is not None:
+            node["inputs"]["strength_model"] = quality["lora"]
 
     # сид меняем на каждом сегменте, иначе движение будет буквально повторяться
     for n in wf.values():
@@ -213,7 +243,10 @@ def extract_output(entry: dict) -> dict | None:
 def grab_anchor(video: Path, out: Path) -> Path:
     cap = cv2.VideoCapture(str(video))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total - 1 - TAIL_OFFSET))
+    # Берём кадр за OVERLAP до конца, а не последний. Два эффекта сразу:
+    # последний кадр обычно самый мыльный, и получается перекрытие для
+    # кроссфейда при склейке.
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total - 1 - OVERLAP_FRAMES))
     ok, frame = cap.read()
     if not ok:
         cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total - 1))
@@ -259,14 +292,45 @@ def match_exposure(video: Path, reference: Path, out: Path) -> Path:
 
 
 def concat_and_upscale(segments: list[Path], workdir: Path, upscale: bool) -> Path:
-    lst = workdir / "concat.txt"
-    lst.write_text("".join(f"file '{s.resolve()}'\n" for s in segments))
+    """
+    Сшивает сегменты кроссфейдом вместо стыка "в лоб".
+
+    Почему стык было видно. Опорный кадр - это статичная картинка, поэтому
+    каждый новый сегмент начинает движение с нуля: скорость обнуляется каждые
+    пять секунд, и глаз это ловит как рывок. Плюс экспозиция чуть разная.
+
+    Лечение: сегменты перекрываются на OVERLAP_FRAMES кадров (последние кадры
+    сегмента N и первые кадры N+1 показывают одно и то же), и мы сводим их
+    плавным переходом. Рывок размазывается по трём четвертям секунды и
+    перестаёт читаться.
+
+    Склеиваем попарно, а не одним filter_complex: пять последовательных xfade
+    считаются несколько секунд, зато код читаемый и не разваливается при смене
+    числа сегментов.
+    """
     joined = workdir / "joined.mp4"
-    subprocess.run([
-        "ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
-        "-vf", "format=yuv420p", "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-        "-movflags", "+faststart", str(joined),
-    ], check=True)
+    if len(segments) == 1:
+        shutil.copy(segments[0], joined)
+    else:
+        seg_dur = FRAMES_PER_SEGMENT / FPS
+        fade = OVERLAP_FRAMES / FPS
+        acc = segments[0]
+        acc_dur = seg_dur
+        for i, nxt in enumerate(segments[1:], start=1):
+            out = workdir / f"xf_{i:03d}.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(acc), "-i", str(nxt),
+                "-filter_complex",
+                f"[0][1]xfade=transition=fade:duration={fade:.3f}"
+                f":offset={acc_dur - fade:.3f},format=yuv420p[v]",
+                "-map", "[v]",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "19", str(out),
+            ], check=True)
+            acc = out
+            # После кроссфейда общая длина = было + новый сегмент - перекрытие
+            acc_dur += seg_dur - fade
+        shutil.copy(acc, joined)
 
     if not upscale:
         return joined
@@ -348,8 +412,15 @@ def handler(job: dict) -> dict:
     seed = int(inp.get("seed", 42))
     upscale = bool(inp.get("upscale", True))
 
+    # Из-за перекрытия каждый сегмент добавляет к хронометражу не всю свою
+    # длину, а на OVERLAP меньше - это учитываем при подсчёте их числа.
     seg_len = FRAMES_PER_SEGMENT / FPS
-    n = max(1, min(MAX_SEGMENTS, round(seconds / seg_len)))
+    step_len = (FRAMES_PER_SEGMENT - OVERLAP_FRAMES) / FPS
+    n = 1 if seconds <= seg_len else 1 + round((seconds - seg_len) / step_len)
+    n = max(1, min(MAX_SEGMENTS, n))
+
+    quality = QUALITY.get(str(inp.get("quality") or DEFAULT_QUALITY),
+                          QUALITY[DEFAULT_QUALITY])
 
     wait_for_comfy()
     template = json.loads(WORKFLOW.read_text())
@@ -371,7 +442,8 @@ def handler(job: dict) -> dict:
 
         # весь чейнинг здесь: модель загружена один раз и живёт в VRAM
         for i in range(n):
-            raw.append(run_segment(template, cfg, prompt, anchor, seed + i, workdir, size))
+            raw.append(run_segment(template, cfg, prompt, anchor, seed + i,
+                                   workdir, size, quality))
             if i < n - 1:
                 anchor = grab_anchor(raw[-1], workdir / f"anchor_{i + 1:03d}.png")
                 if (i + 1) % REFRESH_EVERY == 0:
@@ -387,7 +459,8 @@ def handler(job: dict) -> dict:
         result = deliver(final)
         result.update({
             "segments": n,
-            "duration_sec": round(n * seg_len, 2),
+            "duration_sec": round(seg_len + (n - 1) * step_len, 2),
+            "quality": quality,
             "gpu_seconds": round(gpu_sec, 1),
             # без холодного старта — его RunPod считает отдельно
             "est_cost_usd": round(gpu_sec * 1.10 / 3600, 4),
