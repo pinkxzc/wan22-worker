@@ -1,10 +1,17 @@
 {
   "prompt": "130:107",
+  "negative": "130:125",
   "start_image": "97",
   "video_cfg": "130:128",
   "sampler_high": "130:110",
   "sampler_low": "130:111",
   "video_out": "108",
   "lora_high": "130:126",
-  "lora_low": "130:127"
+  "lora_low": "130:127",
+  "unet_high": "130:122",
+  "unet_low": "130:123",
+  "sampling_high": "130:109",
+  "sampling_low": "130:124",
+  "anchor_pick": "140",
+  "anchor_save": "141"
 }
