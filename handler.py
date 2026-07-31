@@ -28,15 +28,27 @@ RunPod Serverless handler: фото + промт -> видео любой дли
 7. lora=0 действительно обходит ноду (перекоммутация графа), а не грузит её
    с нулевым весом.
 
+8. Убрано неверное утверждение из старой шапки о том, что модель грузится один
+   раз и остаётся в VRAM между сегментами. Логи это опровергают: в каждом
+   промте есть "Model WAN21 ... 13626MB Staged". На 24 ГБ 4090 не помещаются
+   high 13.6 ГБ + low 13.6 ГБ + текстовый энкодер 10.8 ГБ = 38 ГБ, поэтому
+   эксперты свопаются всегда, и заявленная экономия 71% не достигается.
+
+9. Дефолт качества переведён с high на balanced. По логам на 4090 разница
+   между "4 шага + LoRA" и "8 шагов без LoRA" - от 60-70 до 250-460 секунд на
+   сегмент. Почти всё это не шаги, а перечитывание весов с сетевого тома.
+
 Вход:
     {"input": {"image": "<url или base64>", "prompt": "...", "seconds": 30,
-               "quality": "high", "resolution": "720p"}}
+               "quality": "balanced", "resolution": "720p"}}
 Выход:
-    {"video_url": "..."} если настроен S3, иначе {"video_base64": "..."}
+    {"video_url": "..."} если настроен S3, иначе {"video_base64": "..."},
+    плюс "timings" - секунды на каждый сегмент, чтобы видеть распределение
+    времени не залезая в логи воркера.
 
 НАСТРОЙКИ ЭНДПОИНТА
-    Execution Timeout >= 1800 сек. На 720p сегменты считаются дольше, чем в
-    исходной версии на 480p; дефолтных 600 не хватит.
+    Execution Timeout >= 3000 сек. При quality=high сегмент занимает до 460 с,
+    и шесть сегментов упираются ровно в 1800.
     Idle Timeout = 30 сек.
 """
 
@@ -86,14 +98,21 @@ DEFAULT_RESOLUTION = "720p"
 #
 # split=None означает "посчитать по сигме" (moe_split). Там, где стоит число,
 # это рекомендация автора чекпоинта, она приоритетнее расчёта.
+#
+# ВРЕМЯ ЗАМЕРЕНО ПО ЛОГАМ RTX 4090 с моделями на сетевом томе:
+#   4 шага + LoRA  ->  60-70 с/сегмент
+#   8 шагов без LoRA -> 250-460 с/сегмент
+# Разница в 4-6 раз, и она почти вся не в шагах, а в подкачке весов: без LoRA
+# ComfyUI гоняет по 13.6 ГБ на каждое переключение эксперта. Поэтому дефолт -
+# balanced (LoRA остаётся), а не high. См. раздел "Скорость" в README.
 QUALITY = {
-    #  имя         шаги  cfg   сила LoRA  split   примерно на сегмент (720p)
-    "fast":     dict(steps=4,  cfg=1.0, lora=1.0, split=2),   # ~2 мин
-    "balanced": dict(steps=6,  cfg=1.0, lora=1.0, split=3),   # ~3 мин
-    "high":     dict(steps=8,  cfg=1.0, lora=0.0, split=4),   # ~4 мин
-    "max":      dict(steps=10, cfg=2.0, lora=0.0, split=None),# ~5 мин
+    #  имя         шаги  cfg   сила LoRA  split   замер на 4090 / сегмент
+    "fast":     dict(steps=4,  cfg=1.0, lora=1.0, split=2),   # ~60-70 с
+    "balanced": dict(steps=6,  cfg=1.0, lora=1.0, split=3),   # ~90-110 с
+    "high":     dict(steps=8,  cfg=1.0, lora=0.0, split=4),   # ~250-460 с
+    "max":      dict(steps=10, cfg=2.0, lora=0.0, split=None),# ~300-500 с
 }
-DEFAULT_QUALITY = "high"
+DEFAULT_QUALITY = "balanced"
 
 SHIFT = 5.0                   # ModelSamplingSD3 в workflow
 MOE_BOUNDARY = 0.90           # граница экспертов Wan 2.2: 0.90 для I2V, 0.875 для T2V
@@ -468,10 +487,13 @@ def handler(job: dict) -> dict:
 
         started = time.time()
         raw: list[Path] = []
+        timings: list[float] = []
 
         for i in range(n):
+            t0 = time.time()
             seg, seg_anchor = run_segment(template, cfg, prompt, anchor, seed + i,
                                           workdir, size, quality)
+            timings.append(round(time.time() - t0, 1))
             raw.append(seg)
             if i < n - 1:
                 anchor = seg_anchor or grab_anchor_fallback(
@@ -479,7 +501,9 @@ def handler(job: dict) -> dict:
                 if (i + 1) % REFRESH_EVERY == 0:
                     refresh_anchor(anchor, original)
 
+        t_assemble = time.time()
         final = assemble(raw, workdir, upscale)
+        t_assemble = round(time.time() - t_assemble, 1)
 
         gpu_sec = time.time() - started
         result = deliver(final)
@@ -490,6 +514,10 @@ def handler(job: dict) -> dict:
             "quality": {**quality, "split": quality.get("split") or moe_split(quality["steps"])},
             "gpu_seconds": round(gpu_sec, 1),
             "est_cost_usd": round(gpu_sec * 1.10 / 3600, 4),
+            # Первый сегмент почти всегда дольше остальных: веса ещё не в
+            # страничном кэше. Если и последующие держатся на том же уровне -
+            # значит кэш не работает, смотрите раздел "Скорость" в README.
+            "timings": {"segments_sec": timings, "assemble_sec": t_assemble},
         })
         return result
 
