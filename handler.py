@@ -452,12 +452,40 @@ def deliver(path: Path) -> dict:
 
 # --------------------------------------------------------------------- handler
 
+def spread_prompts(prompts: list[str], n: int) -> list[str]:
+    """
+    Раскладывает k промтов-сцен по n сегментам.
+
+    Клиент мыслит сценами по ~5 секунд, а сегментов из-за перекрытия получается
+    больше: 30 секунд это 7 сегментов, а не 6. Поэтому не требуем совпадения, а
+    растягиваем что дали:
+
+        1 промт  на 7 сегментов -> все одинаковые (поведение как раньше)
+        3 промта на 7 сегментов -> [0,0,0,1,1,2,2]
+        7 промтов на 7          -> один к одному
+    """
+    if not prompts:
+        return []
+    k = len(prompts)
+    return [prompts[min(k - 1, i * k // n)] for i in range(n)]
+
+
 def handler(job: dict) -> dict:
     inp = job.get("input", {})
-    prompt = inp.get("prompt")
     image_src = inp.get("image")
-    if not prompt or not image_src:
-        return {"error": "нужны поля 'image' и 'prompt'"}
+
+    # 'prompts' - список сцен, 'prompt' - одна строка на весь ролик.
+    # Поддерживаем оба: старые клиенты продолжают слать 'prompt'.
+    scenes = inp.get("prompts")
+    if isinstance(scenes, str):
+        scenes = [scenes]
+    if not scenes:
+        scenes = [inp["prompt"]] if inp.get("prompt") else []
+    scenes = [s.strip() for s in scenes if isinstance(s, str) and s.strip()]
+
+    if not scenes or not image_src:
+        return {"error": "нужны поля 'image' и 'prompt' (или 'prompts')"}
+    prompt = scenes[0]
 
     seconds = float(inp.get("seconds", 30))
     seed = int(inp.get("seed", 42))
@@ -488,11 +516,12 @@ def handler(job: dict) -> dict:
         started = time.time()
         raw: list[Path] = []
         timings: list[float] = []
+        seg_prompts = spread_prompts(scenes, n)
 
         for i in range(n):
             t0 = time.time()
-            seg, seg_anchor = run_segment(template, cfg, prompt, anchor, seed + i,
-                                          workdir, size, quality)
+            seg, seg_anchor = run_segment(template, cfg, seg_prompts[i], anchor,
+                                          seed + i, workdir, size, quality)
             timings.append(round(time.time() - t0, 1))
             raw.append(seg)
             if i < n - 1:
@@ -518,6 +547,7 @@ def handler(job: dict) -> dict:
             # страничном кэше. Если и последующие держатся на том же уровне -
             # значит кэш не работает, смотрите раздел "Скорость" в README.
             "timings": {"segments_sec": timings, "assemble_sec": t_assemble},
+            "prompts_used": seg_prompts,
         })
         return result
 
