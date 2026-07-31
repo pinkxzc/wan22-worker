@@ -1,31 +1,43 @@
 """
 RunPod Serverless handler: фото + промт -> видео любой длины.
 
-ГЛАВНОЕ АРХИТЕКТУРНОЕ РЕШЕНИЕ
------------------------------
-Весь чейнинг из 6 сегментов происходит ВНУТРИ одного вызова handler.
-Соблазн сделать иначе — послать 6 отдельных запросов в эндпоинт — обойдётся
-на 71% дороже: каждый запрос заново поднимает воркер и грузит 22 ГБ весов.
+ИСПРАВЛЕННАЯ ВЕРСИЯ. Что изменено против оригинала и почему:
 
-    чейнинг внутри одного запроса : $0.193 за 30-сек ролик
-    6 отдельных запросов          : $0.330
+1. QUALITY приведён к рекомендациям автора чекпоинта Remix (8 шагов / split 4
+   без Lightning LoRA, 4 / 2 с ней). Было 20 шагов при cfg 3.5 по умолчанию -
+   это пережигало дистиллированные веса: кислотный цвет, пластиковая кожа.
 
-Внутри одного вызова модель загружается один раз и остаётся в VRAM
-между сегментами. Это же даёт и выигрыш по времени: 6 сегментов подряд
-идут без пауз на переинициализацию.
+2. Граница high/low больше не steps // 2. Она задаётся уровнем сигмы (0.90 для
+   I2V), а не долей шагов, и зависит от shift. См. moe_split(). При 4 шагах
+   старая формула случайно давала верный ответ, при 20 - промахивалась на два
+   шага, отдавая доводку деталей высокошумному эксперту.
 
-ЧТО ВАЖНО ВЫСТАВИТЬ В НАСТРОЙКАХ ЭНДПОИНТА
-------------------------------------------
-  Execution Timeout >= 1200 сек. Дефолтные 600 не хватит: 30-секундный
-  ролик занимает ~10 минут вместе с холодным стартом, и задача будет
-  убита ровно перед возвратом результата.
-  Idle Timeout = 30 сек. Больше — платите за простой, меньше — теряете
-  переиспользование воркера на серии запросов.
+3. Разрешение снапится к нативным бакетам Wan (1280x720 и т.д.), а не считается
+   из постоянной площади. Было ~400k пикселей (480p) с произвольными сторонами
+   вроде 736x544 - вне обучающих бакетов и вдвое ниже дефолта автора модели.
+
+4. Промежуточные файлы больше не пережимаются. Раньше при 6 сегментах первый
+   проходил семь поколений libx264: выравнивание экспозиции, пять попарных
+   xfade и апскейл. Теперь вся сборка - один filter_complex и один энкод.
+
+5. unsharp убран из финального фильтра: поверх lanczos он давал ореолы.
+
+6. Опорный кадр берётся не из готового mp4, а прямо с выхода VAE отдельной
+   веткой SaveImage - без промежуточной компрессии в цепочке чейнинга.
+
+7. lora=0 действительно обходит ноду (перекоммутация графа), а не грузит её
+   с нулевым весом.
 
 Вход:
-    {"input": {"image": "<url или base64>", "prompt": "...", "seconds": 30}}
+    {"input": {"image": "<url или base64>", "prompt": "...", "seconds": 30,
+               "quality": "high", "resolution": "720p"}}
 Выход:
     {"video_url": "..."} если настроен S3, иначе {"video_base64": "..."}
+
+НАСТРОЙКИ ЭНДПОИНТА
+    Execution Timeout >= 1800 сек. На 720p сегменты считаются дольше, чем в
+    исходной версии на 480p; дефолтных 600 не хватит.
+    Idle Timeout = 30 сек.
 """
 
 from __future__ import annotations
@@ -48,88 +60,100 @@ import runpod
 
 COMFY = "http://127.0.0.1:8188"
 WORKFLOW = Path(os.environ.get("WORKFLOW_PATH", "/workflow.json"))
-# Соответствие "роль ноды -> её ID" собирает inspect_workflow.py.
-# Ищем по ID, а не по Title: схема Wan 2.2 - сабграф, при экспорте в API
-# ноды разворачиваются в плоский список с составными ID вида "130:110",
-# и заголовки туда доезжают не всегда.
 CONFIG = Path(os.environ.get("WORKFLOW_CONFIG", "/workflow_config.json"))
 
 FPS = 16                      # нативная частота Wan 2.2 A14B, менять нельзя
 FRAMES_PER_SEGMENT = 81       # 81/16 = 5.06 сек. Должно быть вида 4n+1
-PIXEL_BUDGET = 832 * 480      # ~400k пикселей. Держим постоянным: пропорции берём
-                              # из фото, но площадь не меняем, иначе время и цена
-                              # генерации поехали бы вслед за форматом снимка
-DIM_STEP = 16                 # Wan требует размеры, кратные 16
-MIN_DIM, MAX_DIM = 320, 1280
+DIM_STEP = 16
+
+# Нативные бакеты Wan 2.2. Модель обучена на них; произвольные размеры она
+# переваривает, но артефактов заметно больше. Выбираем ближайший по пропорциям.
+BUCKETS = {
+    "720p": [(1280, 720), (720, 1280), (960, 960)],
+    "480p": [(832, 480), (480, 832), (640, 640)],
+}
+DEFAULT_RESOLUTION = "720p"
 
 # Режимы качества.
 #
-# Главное, что надо понимать про cfg: это и есть механизм следования промту.
-# При cfg=1.0 модель не сравнивает результат с промтом и делает что хочет -
-# отсюда жалобы "просил одно, получил другое". Lightning LoRA обучена без CFG,
-# поэтому четыре шага и послушный промт несовместимы.
+# Чекпоинты Wan2.2 Remix *_lighting_* - ускоренные сборки. Автор модели даёт
+# две проверенные точки: 8 шагов при split 4 без Lightning LoRA, либо 4 шага
+# при split 2 с ней. Всё, что сильно выше по шагам и cfg, работает хуже, а не
+# лучше: дистилляция уже в весах, и высокий guidance её пережигает.
 #
-# Компромисс: ослабляем LoRA и поднимаем cfg. Модель начинает слушаться, но
-# каждый шаг считается дважды (с промтом и без), плюс шагов больше - отсюда
-# рост времени.
+# cfg держим в районе 1.0. Если промт слушается плохо, поднимайте до 2.0-2.5
+# по одному шагу и сравнивайте на фиксированном сиде - запас есть, но узкий.
+#
+# split=None означает "посчитать по сигме" (moe_split). Там, где стоит число,
+# это рекомендация автора чекпоинта, она приоритетнее расчёта.
 QUALITY = {
-    # имя         шаги  cfg   сила LoRA   примерно на сегмент
-    "fast":     dict(steps=4,  cfg=1.0, lora=1.0),   # ~60 сек, промт слабо
-    "balanced": dict(steps=6,  cfg=1.5, lora=0.8),   # ~2 мин,  промт средне
-    "high":     dict(steps=8,  cfg=2.5, lora=0.6),   # ~2.7 мин, промт хорошо
-    "max":      dict(steps=20, cfg=3.5, lora=0.0),   # ~6 мин,  промт отлично
+    #  имя         шаги  cfg   сила LoRA  split   примерно на сегмент (720p)
+    "fast":     dict(steps=4,  cfg=1.0, lora=1.0, split=2),   # ~2 мин
+    "balanced": dict(steps=6,  cfg=1.0, lora=1.0, split=3),   # ~3 мин
+    "high":     dict(steps=8,  cfg=1.0, lora=0.0, split=4),   # ~4 мин
+    "max":      dict(steps=10, cfg=2.0, lora=0.0, split=None),# ~5 мин
 }
-DEFAULT_QUALITY = "max"
+DEFAULT_QUALITY = "high"
 
-# Сегменты перекрываются, чтобы стык не был виден. Каждый следующий сегмент
-# начинается с кадра, который в предыдущем был не последним, а за OVERLAP до
-# конца - и эти кадры мы потом сводим кроссфейдом.
+SHIFT = 5.0                   # ModelSamplingSD3 в workflow
+MOE_BOUNDARY = 0.90           # граница экспертов Wan 2.2: 0.90 для I2V, 0.875 для T2V
+
 OVERLAP_FRAMES = 12           # 0.75 сек при 16 fps
-REFRESH_EVERY = 3             # каждые N сегментов подмешиваем исходное фото
+REFRESH_EVERY = 3
 REFRESH_BLEND = 0.15
-MAX_SEGMENTS = 24             # предохранитель: 24 x 5.06 = ~2 минуты
+MAX_SEGMENTS = 24
 
 S3_BUCKET = os.environ.get("S3_BUCKET")
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT")
 
 
-# ------------------------------------------------------------- ожидание ComfyUI
+# ------------------------------------------------------------------ разрешение
 
-def fit_dimensions(image_path: Path) -> tuple[int, int]:
+def moe_split(steps: int, shift: float = SHIFT, boundary: float = MOE_BOUNDARY) -> int:
     """
-    Подбирает размер кадра под пропорции исходного фото.
+    Сколько первых шагов ведёт высокошумный эксперт.
 
-    Раньше здесь было жёстко 832x480, из-за чего вертикальные снимки и кадры
-    16:9 обрезались. Теперь берём соотношение сторон из самого фото, а площадь
-    оставляем прежней - так ничего не режется, но время генерации не скачет
-    от формата к формату.
+    Wan 2.2 - MoE из двух экспертов, и граница между ними задана уровнем шума,
+    а не номером шага: sigma >= boundary - высокошумный, ниже - низкошумный.
+    Расписание сигм зависит от shift в ModelSamplingSD3:
 
-    Примеры того, что получается:
-        4:3   ->  736 x 544
-        16:9  ->  864 x 480
-        9:16  ->  480 x 864
-        1:1   ->  640 x 640
+        sigma(t) = shift * t / (1 + (shift - 1) * t),   t_i = 1 - i / steps
+
+    Считаем, сколько шагов стартуют выше границы. Для shift=5, boundary=0.90:
+
+        steps=4  -> 2      steps=8  -> 3      steps=20 -> 8
+        steps=6  -> 3      steps=10 -> 4
+
+    Старое steps // 2 совпадает с этим только при 4 и 6 шагах; дальше оно
+    отдаёт высокошумному эксперту лишние шаги, на которых он мылит детали.
     """
+    n_high = 0
+    for i in range(steps):
+        t = 1.0 - i / steps
+        sigma = shift * t / (1.0 + (shift - 1.0) * t)
+        if sigma >= boundary:
+            n_high += 1
+    return max(1, min(steps - 1, n_high))
+
+
+def fit_dimensions(image_path: Path, tier: str = DEFAULT_RESOLUTION) -> tuple[int, int]:
+    """
+    Подбирает ближайший нативный бакет Wan под пропорции фото.
+
+    Раньше здесь сохранялась постоянная площадь ~400k пикселей при произвольных
+    сторонах (736x544, 640x640 и т.п.). Пропорции держались, но размеры уходили
+    из обучающих бакетов, и вдобавок это было 480p там, где автор чекпоинта
+    рекомендует короткую сторону 720.
+    """
+    buckets = BUCKETS.get(tier, BUCKETS[DEFAULT_RESOLUTION])
     img = cv2.imread(str(image_path))
-    if img is None:
-        return 832, 480
-    h, w = img.shape[:2]
-    if h == 0 or w == 0:
-        return 832, 480
-
-    aspect = w / h
-    new_h = (PIXEL_BUDGET / aspect) ** 0.5
-    new_w = new_h * aspect
-
-    def snap(v: float) -> int:
-        v = int(round(v / DIM_STEP) * DIM_STEP)
-        return max(MIN_DIM, min(MAX_DIM, v))
-
-    return snap(new_w), snap(new_h)
+    if img is None or img.shape[0] == 0 or img.shape[1] == 0:
+        return buckets[0]
+    aspect = img.shape[1] / img.shape[0]
+    return min(buckets, key=lambda b: abs(b[0] / b[1] - aspect))
 
 
 def wait_for_comfy(timeout: int = 300) -> None:
-    """Воркер стартует раньше, чем ComfyUI успевает подняться."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -144,13 +168,11 @@ def wait_for_comfy(timeout: int = 300) -> None:
 # ------------------------------------------------------------------ ComfyUI API
 
 def node_by_role(wf: dict, cfg: dict, role: str, required: bool = True) -> dict | None:
-    """Достаёт ноду по роли из workflow_config.json."""
     nid = cfg.get(role)
     if nid is None or nid not in wf:
         if required:
             raise RuntimeError(
-                f"В workflow_config.json нет роли '{role}' либо такой ноды нет в схеме. "
-                f"Прогоните inspect_workflow.py на экспортированном JSON."
+                f"В workflow_config.json нет роли '{role}' либо такой ноды нет в схеме."
             )
         return None
     return wf[nid]
@@ -170,8 +192,9 @@ def upload_image(path: Path) -> str:
 
 def run_segment(template: dict, cfg: dict, prompt: str, start: Path,
                 seed: int, workdir: Path, size: tuple[int, int],
-                quality: dict) -> Path:
-    wf = json.loads(json.dumps(template))  # глубокая копия: шаблон не мутируем
+                quality: dict) -> tuple[Path, Path | None]:
+    """Возвращает (видео сегмента, опорный кадр в png или None)."""
+    wf = json.loads(json.dumps(template))
 
     node_by_role(wf, cfg, "prompt")["inputs"]["text"] = prompt
     node_by_role(wf, cfg, "start_image")["inputs"]["image"] = upload_image(start)
@@ -181,26 +204,40 @@ def run_segment(template: dict, cfg: dict, prompt: str, start: Path,
     video["inputs"]["width"], video["inputs"]["height"] = size
 
     steps = quality["steps"]
+    split = quality.get("split") or moe_split(steps)
+    split = max(1, min(steps - 1, split))
+
     high = node_by_role(wf, cfg, "sampler_high")
     low = node_by_role(wf, cfg, "sampler_low")
     for s in (high, low):
         s["inputs"]["steps"] = steps
         s["inputs"]["cfg"] = quality["cfg"]
-    # Wan 2.2 - MoE: первую половину шагов ведёт высокошумный эксперт, вторую
-    # низкошумный. Границу держим ровно посередине.
     high["inputs"]["start_at_step"] = 0
-    high["inputs"]["end_at_step"] = steps // 2
-    low["inputs"]["start_at_step"] = steps // 2
+    high["inputs"]["end_at_step"] = split
+    low["inputs"]["start_at_step"] = split
     low["inputs"]["end_at_step"] = 10000
 
-    # Сила Lightning LoRA. При cfg > 1 её надо ослабить, иначе дистилляция
-    # перебивает guidance и промт всё равно игнорируется. Ноль - обход ноды.
-    for role in ("lora_high", "lora_low"):
-        node = node_by_role(wf, cfg, role, required=False)
-        if node is not None:
-            node["inputs"]["strength_model"] = quality["lora"]
+    # Lightning LoRA. При нулевой силе обходим ноду перекоммутацией: подаём
+    # ModelSamplingSD3 напрямую с загрузчика UNET. Установка strength_model=0
+    # ноду не выключает - файл всё равно грузится и занимает VRAM.
+    if quality["lora"] <= 0.0:
+        for samp_role, unet_role in (("sampling_high", "unet_high"),
+                                     ("sampling_low", "unet_low")):
+            samp = node_by_role(wf, cfg, samp_role, required=False)
+            unet_id = cfg.get(unet_role)
+            if samp is not None and unet_id:
+                samp["inputs"]["model"] = [unet_id, 0]
+    else:
+        for role in ("lora_high", "lora_low"):
+            node = node_by_role(wf, cfg, role, required=False)
+            if node is not None:
+                node["inputs"]["strength_model"] = quality["lora"]
 
-    # сид меняем на каждом сегменте, иначе движение будет буквально повторяться
+    # Опорный кадр забираем прямо с выхода VAE, до сохранения в mp4.
+    picker = node_by_role(wf, cfg, "anchor_pick", required=False)
+    if picker is not None:
+        picker["inputs"]["batch_index"] = max(0, FRAMES_PER_SEGMENT - 1 - OVERLAP_FRAMES)
+
     for n in wf.values():
         for key in ("seed", "noise_seed"):
             if key in n.get("inputs", {}):
@@ -220,32 +257,54 @@ def run_segment(template: dict, cfg: dict, prompt: str, start: Path,
         if entry.get("status", {}).get("status_str") == "error":
             raise RuntimeError(f"Ошибка генерации: {json.dumps(entry['status'])[:400]}")
         meta = extract_output(entry)
-        if meta:
-            dst = workdir / f"seg_{uuid.uuid4().hex[:8]}.mp4"
-            dst.write_bytes(requests.get(f"{COMFY}/view", params=meta, timeout=300).content)
-            return dst
+        if not meta:
+            continue
+
+        tag = uuid.uuid4().hex[:8]
+        dst = workdir / f"seg_{tag}.mp4"
+        dst.write_bytes(requests.get(f"{COMFY}/view", params=meta, timeout=300).content)
+
+        anchor = None
+        amet = extract_anchor(entry, cfg.get("anchor_save"))
+        if amet:
+            anchor = workdir / f"anchor_{tag}.png"
+            anchor.write_bytes(
+                requests.get(f"{COMFY}/view", params=amet, timeout=300).content)
+        return dst, anchor
+
+
+def _meta(f: dict) -> dict:
+    return {"filename": f["filename"],
+            "subfolder": f.get("subfolder", ""),
+            "type": f.get("type", "output")}
 
 
 def extract_output(entry: dict) -> dict | None:
     for node in entry.get("outputs", {}).values():
         for key in ("gifs", "videos", "images"):
-            if node.get(key):
-                f = node[key][0]
+            for f in node.get(key, []):
                 if f["filename"].endswith((".mp4", ".webm")):
-                    return {"filename": f["filename"],
-                            "subfolder": f.get("subfolder", ""),
-                            "type": f.get("type", "output")}
+                    return _meta(f)
+    return None
+
+
+def extract_anchor(entry: dict, node_id: str | None) -> dict | None:
+    """Опорный кадр — PNG с ноды SaveImage, а не кадр из сжатого mp4."""
+    if not node_id:
+        return None
+    node = entry.get("outputs", {}).get(node_id, {})
+    for f in node.get("images", []):
+        if f["filename"].lower().endswith(".png"):
+            return _meta(f)
     return None
 
 
 # ----------------------------------------------------------- кадры, цвет, сборка
 
-def grab_anchor(video: Path, out: Path) -> Path:
+def grab_anchor_fallback(video: Path, out: Path) -> Path:
+    """Запасной путь, если в workflow нет ветки SaveImage для опорного кадра."""
     cap = cv2.VideoCapture(str(video))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    # Берём кадр за OVERLAP до конца, а не последний. Два эффекта сразу:
-    # последний кадр обычно самый мыльный, и получается перекрытие для
-    # кроссфейда при склейке.
     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total - 1 - OVERLAP_FRAMES))
     ok, frame = cap.read()
     if not ok:
@@ -259,7 +318,7 @@ def grab_anchor(video: Path, out: Path) -> Path:
 
 
 def refresh_anchor(anchor: Path, original: Path) -> None:
-    """Подмешивает исходное фото — сбрасывает накопленный дрейф личности."""
+    """Подмешивает исходное фото — сбрасывает накопленный дрейф внешности."""
     a, o = cv2.imread(str(anchor)), cv2.imread(str(original))
     if a is None or o is None:
         return
@@ -267,109 +326,83 @@ def refresh_anchor(anchor: Path, original: Path) -> None:
     cv2.imwrite(str(anchor), cv2.addWeighted(a, 1 - REFRESH_BLEND, o, REFRESH_BLEND, 0))
 
 
-def match_exposure(video: Path, reference: Path, out: Path) -> Path:
-    """Выравнивает яркость сегмента по первому — убирает ступеньки на стыках."""
-    def mid_lightness(v: Path) -> float:
-        cap = cv2.VideoCapture(str(v))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) // 2)
-        ok, frame = cap.read()
-        cap.release()
-        if not ok:
-            return 128.0
-        return float(cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
-
-    delta = float(np.clip((mid_lightness(reference) - mid_lightness(video)) / 255.0, -0.3, 0.3))
-    if abs(delta) < 0.01:            # в пределах шума — не трогаем
-        shutil.copy(video, out)
-        return out
-
-    subprocess.run([
-        "ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
-        "-vf", f"eq=brightness={delta:.4f}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18", str(out),
-    ], check=True)
-    return out
+def mid_lightness(v: Path) -> float:
+    cap = cv2.VideoCapture(str(v))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) // 2)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return 128.0
+    return float(cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
 
 
-def concat_and_upscale(segments: list[Path], workdir: Path, upscale: bool) -> Path:
+def assemble(segments: list[Path], workdir: Path, upscale: bool) -> Path:
     """
-    Сшивает сегменты кроссфейдом вместо стыка "в лоб".
+    Собирает все сегменты за ОДИН вызов ffmpeg и ОДИН энкод.
 
-    Почему стык было видно. Опорный кадр - это статичная картинка, поэтому
-    каждый новый сегмент начинает движение с нуля: скорость обнуляется каждые
-    пять секунд, и глаз это ловит как рывок. Плюс экспозиция чуть разная.
+    В оригинале выравнивание экспозиции и каждая пара xfade кодировались
+    отдельно, и для 30-секундного ролика первый сегмент проходил семь
+    поколений libx264 crf 18-20. На градиентах это бандинг, на коже - блоки.
 
-    Лечение: сегменты перекрываются на OVERLAP_FRAMES кадров (последние кадры
-    сегмента N и первые кадры N+1 показывают одно и то же), и мы сводим их
-    плавным переходом. Рывок размазывается по трём четвертям секунды и
-    перестаёт читаться.
-
-    Склеиваем попарно, а не одним filter_complex: пять последовательных xfade
-    считаются несколько секунд, зато код читаемый и не разваливается при смене
-    числа сегментов.
+    Здесь выравнивание яркости (eq), все кроссфейды и опциональный апскейл
+    собраны в один filter_complex. Ролик кодируется ровно один раз.
     """
-    joined = workdir / "joined.mp4"
-    if len(segments) == 1:
-        shutil.copy(segments[0], joined)
-    else:
-        seg_dur = FRAMES_PER_SEGMENT / FPS
-        fade = OVERLAP_FRAMES / FPS
-        acc = segments[0]
-        acc_dur = seg_dur
-        for i, nxt in enumerate(segments[1:], start=1):
-            out = workdir / f"xf_{i:03d}.mp4"
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", str(acc), "-i", str(nxt),
-                "-filter_complex",
-                f"[0][1]xfade=transition=fade:duration={fade:.3f}"
-                f":offset={acc_dur - fade:.3f},format=yuv420p[v]",
-                "-map", "[v]",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "19", str(out),
-            ], check=True)
-            acc = out
-            # После кроссфейда общая длина = было + новый сегмент - перекрытие
-            acc_dur += seg_dur - fade
-        shutil.copy(acc, joined)
+    out = workdir / "final.mp4"
+    seg_dur = FRAMES_PER_SEGMENT / FPS
+    fade = OVERLAP_FRAMES / FPS
 
-    if not upscale:
-        return joined
+    # Яркость каждого сегмента подтягиваем к первому.
+    ref = mid_lightness(segments[0])
+    deltas = [0.0] + [
+        float(np.clip((ref - mid_lightness(s)) / 255.0, -0.3, 0.3))
+        for s in segments[1:]
+    ]
 
-    # Увеличиваем в 1.5 раза по обеим сторонам, а не до фиксированной высоты 720.
-    # Иначе вертикальное видео 480x848 после "scale=-2:720" стало бы 408x720,
-    # то есть уменьшилось бы вместо апскейла.
-    out = workdir / "final_up.mp4"
-    subprocess.run([
-        "ffmpeg", "-y", "-loglevel", "error", "-i", str(joined),
-        "-vf", "scale=iw*1.5:ih*1.5:flags=lanczos,"
-               "scale=trunc(iw/2)*2:trunc(ih/2)*2,unsharp=5:5:0.6",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-movflags", "+faststart", str(out),
-    ], check=True)
+    filters: list[str] = []
+    labels: list[str] = []
+    for i, d in enumerate(deltas):
+        if abs(d) < 0.01:
+            labels.append(f"{i}:v")
+        else:
+            filters.append(f"[{i}:v]eq=brightness={d:.4f}[e{i}]")
+            labels.append(f"e{i}")
+
+    prev = labels[0]
+    for k in range(1, len(segments)):
+        nxt = f"x{k}"
+        filters.append(
+            f"[{prev}][{labels[k]}]xfade=transition=fade"
+            f":duration={fade:.3f}:offset={k * (seg_dur - fade):.3f}[{nxt}]"
+        )
+        prev = nxt
+
+    # Апскейл без unsharp: поверх lanczos он рисовал ореолы по контурам.
+    tail = "scale=iw*1.5:ih*1.5:flags=lanczos," if upscale else ""
+    filters.append(f"[{prev}]{tail}scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[out]")
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    for s in segments:
+        cmd += ["-i", str(s)]
+    cmd += [
+        "-filter_complex", ";".join(filters),
+        "-map", "[out]",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "16",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True)
     return out
 
 
 # ------------------------------------------------------------------- ввод/вывод
 
 def purge_comfy_dirs() -> None:
-    """
-    Чистит рабочие папки ComfyUI после генерации.
-
-    Наш собственный workdir убирается в finally, а вот ComfyUI складывает
-    результат каждого сегмента в /comfyui/output, а каждый загруженный опорный
-    кадр - в /comfyui/input, и сам их никогда не удаляет. Пока воркер тёплый и
-    обслуживает запрос за запросом, там копится около 20 МБ на каждый
-    30-секундный ролик.
-
-    При остановке воркера контейнер стирается целиком, так что это подстраховка
-    на случай долгой непрерывной нагрузки, когда воркер живёт часами.
-    """
     for sub in ("output", "input", "temp"):
         d = Path("/comfyui") / sub
         if not d.is_dir():
             continue
         for p in d.iterdir():
-            if p.name.startswith("."):      # служебные файлы ComfyUI не трогаем
+            if p.name.startswith("."):
                 continue
             try:
                 shutil.rmtree(p) if p.is_dir() else p.unlink()
@@ -386,7 +419,6 @@ def fetch_input_image(src: str, dst: Path) -> Path:
 
 
 def deliver(path: Path) -> dict:
-    """S3 если настроен, иначе base64. 30-сек ролик в 480p весит ~2-4 МБ."""
     if S3_BUCKET:
         import boto3
         key = f"videos/{uuid.uuid4().hex}.mp4"
@@ -410,10 +442,9 @@ def handler(job: dict) -> dict:
 
     seconds = float(inp.get("seconds", 30))
     seed = int(inp.get("seed", 42))
-    upscale = bool(inp.get("upscale", True))
+    upscale = bool(inp.get("upscale", False))   # на 720p наивный апскейл не нужен
+    tier = str(inp.get("resolution") or DEFAULT_RESOLUTION)
 
-    # Из-за перекрытия каждый сегмент добавляет к хронометражу не всю свою
-    # длину, а на OVERLAP меньше - это учитываем при подсчёте их числа.
     seg_len = FRAMES_PER_SEGMENT / FPS
     step_len = (FRAMES_PER_SEGMENT - OVERLAP_FRAMES) / FPS
     n = 1 if seconds <= seg_len else 1 + round((seconds - seg_len) / step_len)
@@ -432,37 +463,32 @@ def handler(job: dict) -> dict:
         anchor = workdir / "anchor_000.png"
         shutil.copy(original, anchor)
 
-        # Пропорции кадра берём из фото, чтобы 16:9 и вертикальные снимки
-        # не обрезались. Клиент может задать размер явно через width/height.
         size = (int(inp["width"]), int(inp["height"])) \
-            if inp.get("width") and inp.get("height") else fit_dimensions(original)
+            if inp.get("width") and inp.get("height") else fit_dimensions(original, tier)
 
         started = time.time()
         raw: list[Path] = []
 
-        # весь чейнинг здесь: модель загружена один раз и живёт в VRAM
         for i in range(n):
-            raw.append(run_segment(template, cfg, prompt, anchor, seed + i,
-                                   workdir, size, quality))
+            seg, seg_anchor = run_segment(template, cfg, prompt, anchor, seed + i,
+                                          workdir, size, quality)
+            raw.append(seg)
             if i < n - 1:
-                anchor = grab_anchor(raw[-1], workdir / f"anchor_{i + 1:03d}.png")
+                anchor = seg_anchor or grab_anchor_fallback(
+                    seg, workdir / f"anchor_{i + 1:03d}.png")
                 if (i + 1) % REFRESH_EVERY == 0:
                     refresh_anchor(anchor, original)
 
-        fixed = [raw[0]] + [
-            match_exposure(s, raw[0], workdir / f"fixed_{i:03d}.mp4")
-            for i, s in enumerate(raw[1:], start=1)
-        ]
-        final = concat_and_upscale(fixed, workdir, upscale)
+        final = assemble(raw, workdir, upscale)
 
         gpu_sec = time.time() - started
         result = deliver(final)
         result.update({
             "segments": n,
             "duration_sec": round(seg_len + (n - 1) * step_len, 2),
-            "quality": quality,
+            "resolution": f"{size[0]}x{size[1]}",
+            "quality": {**quality, "split": quality.get("split") or moe_split(quality["steps"])},
             "gpu_seconds": round(gpu_sec, 1),
-            # без холодного старта — его RunPod считает отдельно
             "est_cost_usd": round(gpu_sec * 1.10 / 3600, 4),
         })
         return result
