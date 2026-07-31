@@ -80,6 +80,23 @@ RUN printf '%s\n' \
     '  vae: models/vae' \
     > $COMFY/extra_model_paths.yaml
 
+# ------------------------------------------- ОПЦИЯ: модели внутрь образа
+# Логи показывают ~85 секунд на каждую подкачку эксперта: 13626 МБ с сетевого
+# тома на 160 МБ/с. Свопы неизбежны (high 13.6 + low 13.6 + энкодер 10.8 = 38 ГБ
+# при 24 ГБ VRAM), поэтому единственный радикальный способ - положить веса на
+# локальный диск воркера.
+#
+# Цена: образ вырастает с ~10 до ~40 ГБ, первый pull на новом воркере долгий.
+# Выигрыш: минус ~170 секунд на каждый сегмент.
+#
+# Чтобы включить - положите модели рядом с Dockerfile в папку models/ и
+# раскомментируйте. Тогда extra_model_paths.yaml ниже уже не нужен.
+#
+# COPY models/diffusion_models /comfyui/models/diffusion_models
+# COPY models/text_encoders    /comfyui/models/text_encoders
+# COPY models/loras            /comfyui/models/loras
+# COPY models/vae              /comfyui/models/vae
+
 COPY handler.py /handler.py
 COPY workflow_config.json /workflow_config.json
 COPY wan22_i2v_api.json /workflow.json
