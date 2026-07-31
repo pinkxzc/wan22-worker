@@ -1,36 +1,11 @@
 {
   "97": {
     "inputs": {
-      "image": "photo_2026-05-18_12-14-45.jpg"
+      "image": "placeholder.png"
     },
     "class_type": "LoadImage",
     "_meta": {
       "title": "Start Frame Image"
-    }
-  },
-  "108": {
-    "inputs": {
-      "filename_prefix": "video/Wan2.2_image_to_video",
-      "format": "auto",
-      "codec": "auto",
-      "video-preview": "",
-      "video": [
-        "130:117",
-        0
-      ]
-    },
-    "class_type": "SaveVideo",
-    "_meta": {
-      "title": "Сохранить видео"
-    }
-  },
-  "132": {
-    "inputs": {
-      "unet_name": "Wan2.2-I2V-A14B-HighNoise-Q5_K_M.gguf"
-    },
-    "class_type": "UnetLoaderGGUF",
-    "_meta": {
-      "title": "Unet Loader (GGUF)"
     }
   },
   "130:105": {
@@ -55,27 +30,68 @@
   },
   "130:122": {
     "inputs": {
-      "unet_name": "Wan2.2_Remix_NSFW_i2v_14b_high_lighting_v2.0.safetensors",
+      "unet_name": "Wan2.2_Remix_NSFW_i2v_14b_high_lighting_fp8_e4m3fn_v3.0.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
     "_meta": {
-      "title": "Загрузить модель диффузии"
+      "title": "UNET High Noise"
     }
   },
   "130:123": {
     "inputs": {
-      "unet_name": "Wan2.2_Remix_NSFW_i2v_14b_low_lighting_v2.0.safetensors",
+      "unet_name": "Wan2.2_Remix_NSFW_i2v_14b_low_lighting_fp8_e4m3fn_v3.0.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
     "_meta": {
-      "title": "Загрузить модель диффузии"
+      "title": "UNET Low Noise"
+    }
+  },
+  "130:126": {
+    "inputs": {
+      "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "130:122",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Lightning LoRA High"
+    }
+  },
+  "130:127": {
+    "inputs": {
+      "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "130:123",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Lightning LoRA Low"
+    }
+  },
+  "130:109": {
+    "inputs": {
+      "shift": 5.0,
+      "model": [
+        "130:126",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "ModelSampling High (shift)"
     }
   },
   "130:124": {
     "inputs": {
-      "shift": 5.000000000000001,
+      "shift": 5.0,
       "model": [
         "130:127",
         0
@@ -83,12 +99,12 @@
     },
     "class_type": "ModelSamplingSD3",
     "_meta": {
-      "title": "Выборка модели SD3"
+      "title": "ModelSampling Low (shift)"
     }
   },
   "130:107": {
     "inputs": {
-      "text": "Gangbang: A crowd of men fucks a girl",
+      "text": "placeholder positive prompt",
       "clip": [
         "130:105",
         0
@@ -109,55 +125,14 @@
     },
     "class_type": "CLIPTextEncode",
     "_meta": {
-      "title": "CLIP Text Encode (Negative Prompt)"
-    }
-  },
-  "130:126": {
-    "inputs": {
-      "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
-      "strength_model": 1.0000000000000002,
-      "model": [
-        "130:122",
-        0
-      ]
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "Загрузчик LoRA (Только модель)"
-    }
-  },
-  "130:127": {
-    "inputs": {
-      "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
-      "strength_model": 1.0000000000000002,
-      "model": [
-        "130:123",
-        0
-      ]
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "Загрузчик LoRA (Только модель)"
-    }
-  },
-  "130:109": {
-    "inputs": {
-      "shift": 5.000000000000001,
-      "model": [
-        "130:126",
-        0
-      ]
-    },
-    "class_type": "ModelSamplingSD3",
-    "_meta": {
-      "title": "Выборка модели SD3"
+      "title": "CLIP Text Encode (Negative Prompt) — работает только при cfg > 1"
     }
   },
   "130:128": {
     "inputs": {
-      "width": 720,
+      "width": 1280,
       "height": 720,
-      "length": 161,
+      "length": 81,
       "batch_size": 1,
       "positive": [
         "130:107",
@@ -178,19 +153,19 @@
     },
     "class_type": "WanImageToVideo",
     "_meta": {
-      "title": "WanИзображениеВВидео"
+      "title": "WanImageToVideo"
     }
   },
   "130:110": {
     "inputs": {
       "add_noise": "enable",
-      "noise_seed": 406158171636396,
-      "steps": 4,
-      "cfg": 1,
+      "noise_seed": 42,
+      "steps": 8,
+      "cfg": 1.0,
       "sampler_name": "euler",
       "scheduler": "simple",
       "start_at_step": 0,
-      "end_at_step": 2,
+      "end_at_step": 4,
       "return_with_leftover_noise": "enable",
       "model": [
         "130:109",
@@ -211,18 +186,18 @@
     },
     "class_type": "KSamplerAdvanced",
     "_meta": {
-      "title": "KSampler (Расширенный)"
+      "title": "KSampler High Noise (шаги 0..split)"
     }
   },
   "130:111": {
     "inputs": {
       "add_noise": "disable",
       "noise_seed": 0,
-      "steps": 4,
-      "cfg": 1,
+      "steps": 8,
+      "cfg": 1.0,
       "sampler_name": "euler",
       "scheduler": "simple",
-      "start_at_step": 2,
+      "start_at_step": 4,
       "end_at_step": 10000,
       "return_with_leftover_noise": "disable",
       "model": [
@@ -244,21 +219,7 @@
     },
     "class_type": "KSamplerAdvanced",
     "_meta": {
-      "title": "KSampler (Расширенный)"
-    }
-  },
-  "130:117": {
-    "inputs": {
-      "fps": 16,
-      "bit_depth": 8,
-      "images": [
-        "130:129",
-        0
-      ]
-    },
-    "class_type": "CreateVideo",
-    "_meta": {
-      "title": "Создать видео"
+      "title": "KSampler Low Noise (шаги split..конец)"
     }
   },
   "130:129": {
@@ -275,6 +236,62 @@
     "class_type": "VAEDecode",
     "_meta": {
       "title": "Декодировать VAE"
+    }
+  },
+  "140": {
+    "inputs": {
+      "image": [
+        "130:129",
+        0
+      ],
+      "batch_index": 68,
+      "length": 1
+    },
+    "class_type": "ImageFromBatch",
+    "_meta": {
+      "title": "Опорный кадр для следующего сегмента"
+    }
+  },
+  "141": {
+    "inputs": {
+      "images": [
+        "140",
+        0
+      ],
+      "filename_prefix": "anchor/frame"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Сохранить опорный кадр (PNG, без компрессии)"
+    }
+  },
+  "130:117": {
+    "inputs": {
+      "fps": 16,
+      "bit_depth": 8,
+      "images": [
+        "130:129",
+        0
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "Создать видео"
+    }
+  },
+  "108": {
+    "inputs": {
+      "filename_prefix": "video/Wan2.2_image_to_video",
+      "format": "auto",
+      "codec": "auto",
+      "video": [
+        "130:117",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "Сохранить видео"
     }
   }
 }
