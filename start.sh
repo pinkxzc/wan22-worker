@@ -19,6 +19,17 @@ if [ ! -d "$MODELS" ]; then
 else
   echo "worker: модели на томе:"
   ls -1 "$MODELS" | head
+
+  # Воркер ожидает чекпоинты v3.0. Если на томе лежат только v2.0, генерация
+  # упадёт с "model not found" уже на первом сегменте - предупреждаем заранее.
+  for f in Wan2.2_Remix_NSFW_i2v_14b_high_lighting_fp8_e4m3fn_v3.0.safetensors \
+           Wan2.2_Remix_NSFW_i2v_14b_low_lighting_fp8_e4m3fn_v3.0.safetensors; do
+    if [ ! -f "$MODELS/$f" ]; then
+      echo "worker: ВНИМАНИЕ - нет $f"
+      echo "worker:   скачайте с huggingface.co/FX-FeiHou/wan2.2-Remix (папка NSFW)"
+      echo "worker:   либо верните имена v2.0 в wan22_i2v_api.json"
+    fi
+  done
 fi
 
 python /comfyui/main.py \
