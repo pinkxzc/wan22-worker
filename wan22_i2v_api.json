@@ -12,11 +12,11 @@
     "inputs": {
       "clip_name": "nsfw_wan_umt5-xxl_fp8_scaled.safetensors",
       "type": "wan",
-      "device": "default"
+      "device": "cpu"
     },
     "class_type": "CLIPLoader",
     "_meta": {
-      "title": "Загрузить CLIP"
+      "title": "CLIP на CPU — освобождает 10.8 ГБ VRAM"
     }
   },
   "130:106": {
