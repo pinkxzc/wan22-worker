@@ -32,6 +32,31 @@ else
   done
 fi
 
+# Прогрев страничного кэша.
+#
+# Зачем. В логах каждое переключение эксперта high<->low даёт ~85 секунд
+# "Model Initializing": 13626 МБ делить на 85 с - это ровно 160 МБ/с, скорость
+# сетевого тома. Веса перечитываются по сети при каждом свопе, а свопятся они
+# всегда: high 13.6 + low 13.6 + текстовый энкодер 10.8 = 38 ГБ при 24 ГБ VRAM.
+#
+# Если оперативной памяти хватает, один раз протащим файлы через кэш - дальше
+# ComfyUI будет брать их из RAM, а не с сети. Нужно ~38 ГБ свободной памяти;
+# при меньшем объёме прогрев бесполезен (кэш вытеснится), поэтому проверяем.
+if [ "${WARM_MODELS:-1}" = "1" ] && [ -d "$MODELS" ]; then
+  FREE_GB=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
+  NEED_GB=$(du -scBG "$MODELS"/*.safetensors 2>/dev/null | tail -1 | tr -dc '0-9')
+  NEED_GB=${NEED_GB:-99}
+  if [ "$FREE_GB" -gt "$NEED_GB" ]; then
+    echo "worker: прогрев кэша (${NEED_GB} ГБ моделей, ${FREE_GB} ГБ свободно)"
+    time cat "$MODELS"/*.safetensors > /dev/null 2>&1 || true
+    echo "worker: прогрев завершён"
+  else
+    echo "worker: прогрев пропущен - нужно ${NEED_GB} ГБ, доступно ${FREE_GB} ГБ."
+    echo "worker: первый сегмент будет медленным (~85 с на подкачку эксперта)."
+    echo "worker: варианты - взять воркер с большей RAM либо запечь модели в образ."
+  fi
+fi
+
 python /comfyui/main.py \
     --listen 127.0.0.1 --port 8188 \
     --use-sage-attention \
